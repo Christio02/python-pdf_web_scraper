@@ -1,5 +1,5 @@
 # Author: Scott Grivner
-# Website: scottgrivner.dev
+# Website: linktr.ee/scottgriv
 # Abstract: Scrape a web page for PDF files and download them all locally.
 
 # Import Modules
