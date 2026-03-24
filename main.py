@@ -1,156 +1,280 @@
-# Author: Scott Grivner
-# Website: linktr.ee/scottgriv
-# Abstract: Scrape a web page for PDF files and download them all locally.
+# Author: Scott Grivner (original), adapted for dynamic column detection
+# Abstract: Scrape NTNU exam pages for PDF files and download them.
 
-# Import Modules
 import os
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
+
 import requests
-from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
-# Define your URL
-url = "https://wiki.math.ntnu.no/tma4412/2025h/eksamen"
+urls = [
+    "https://www.ntnu.no/fysikk/eksamen/landing/-/asset_publisher/uwSAlUJoweyy/content/tfy4125-fysikk"
+]
 
-# If there is no such folder, the script will create one automatically
 folder_location = r"./downloads"
+lf_folder = os.path.join(folder_location, "lf")
+oppgave_folder = os.path.join(folder_location, "oppgave")
 
-lf_folder = rf"{folder_location}/lf"
-oppgave_folder = rf"{folder_location}/oppgave"
-
-if not os.path.exists(folder_location):
-    os.mkdir(folder_location)
-
-if not os.path.exists(lf_folder):
-    os.mkdir(lf_folder)
-
-if not os.path.exists(oppgave_folder):
-    os.mkdir(oppgave_folder)
-
-# Fetch page content
-try:
-    response = requests.get(url, timeout=10)
-    response.raise_for_status()  # Raise an error for bad status codes
-except requests.RequestException as e:
-    print(f"Failed to fetch the page: {e}")
-    exit(1)
-soup = BeautifulSoup(response.text, "html.parser")
-
-# List to store downloaded PDF filenames
-downloaded_pdfs = []
-pdf_count = 1  # Counter for unnamed PDFs
-
-midtsemester_heading = soup.find("h2", id="tidligere_midtsemesterprover_med_fasit")
-if midtsemester_heading:
-    # Find the next div.level2 sibling which contains the content
-    section_div = midtsemester_heading.find_next_sibling("div", class_="level2")
-    if section_div:
-        section_div.decompose()  # Remove this section from the tree
-        print("Excluded midtsemester section from download.")
+for folder in [folder_location, lf_folder, oppgave_folder]:
+    os.makedirs(folder, exist_ok=True)
 
 
-def get_unique_filename(folder, filename):
-    """Ensures filename is unique by appending a number if the file already exists."""
+def get_unique_filepath(folder, filename):
     base, ext = os.path.splitext(filename)
-    counter = 2  # Start numbering at (2) if a duplicate is found
-
-    new_filename = filename
-    while os.path.exists(os.path.join(folder, new_filename)):
-        new_filename = f"{base} ({counter}){ext}"
+    candidate = os.path.join(folder, filename)
+    counter = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(folder, f"{base} ({counter}){ext}")
         counter += 1
-
-    return os.path.join(folder, new_filename)
+    return candidate
 
 
 def get_pdf_filename(pdf_url):
-    """Extracts filename from URL or generates a default one if missing."""
-    global pdf_count
-    parsed_url = urlparse(pdf_url)
+    parsed = urlparse(pdf_url)
+    filename = None
 
-    # Check if this is a fetch.php URL with a media parameter
-    if "fetch.php" in parsed_url.path:
-        from urllib.parse import parse_qs
+    if "ntnu.no/documents" in pdf_url:
+        filename = unquote(os.path.basename(parsed.path))
 
-        query_params = parse_qs(parsed_url.query)
-
-        # Extract the media parameter which contains the actual PDF URL
-        if "media" in query_params:
-            media_url = query_params["media"][0]
-            # Get filename from the media URL
+    elif "fetch.php" in parsed.path:
+        params = parse_qs(parsed.query)
+        if "media" in params:
+            media_url = params["media"][0]
             filename = os.path.basename(urlparse(media_url).path)
-            if filename and filename.endswith(".pdf"):
-                if (
-                    "lf" in filename
-                    or "LF" in filename
-                    or "losningsforslag" in filename
-                    or "fasit" in filename
-                    or "solution" in filename
-                ):
-                    return get_unique_filename(lf_folder, filename)
-                return get_unique_filename(oppgave_folder, filename)
 
-    # Standard extraction for direct PDF links
-    filename = os.path.basename(parsed_url.path)
+    if not filename:
+        filename = os.path.basename(parsed.path)
 
-    # Assign a default name if the filename is missing or not a PDF
-    if not filename or not filename.endswith(".pdf"):
-        filename = f"Downloaded_PDF_{pdf_count}.pdf"
-        pdf_count += 1
+    if filename:
+        filename = unquote(filename)
 
-    if (
-        "lf" in filename
-        or "LF" in filename
-        or "losningsforslag" in filename
-        or "fasit" in filename
-        or "solution" in filename
-    ):
-        return get_unique_filename(lf_folder, filename)
-    return get_unique_filename(oppgave_folder, filename)
+    if not filename or not filename.lower().endswith(".pdf"):
+        filename = "Downloaded_PDF.pdf"
+
+    return filename
 
 
-def download_pdf(pdf_url, source="link"):
-    """Downloads a PDF from the given URL."""
+def is_lf_filename(filename):
+    name = filename.lower()
+    return any(
+        kw in name
+        for kw in [
+            "lf",
+            "losning",
+            "løsning",
+            "losningsforslag",
+            "fasit",
+            "solution",
+            "sol",
+            "soln",
+            "answer",
+            "ans",
+            "korrektur",
+        ]
+    )
+
+
+def detect_column_roles(table):
+    """
+    Inspect the <thead> (or first <tr> with <th>) to map column indices
+    to roles: 'oppgave', 'lf', or None.
+    Returns a dict: {col_index: 'oppgave' | 'lf' | None}
+    """
+
+    OPPGAVE_KEYWORDS = {
+        "bokmål",
+        "bm",
+        "oppgaver",
+        "problems",
+        "problem",
+        "nb",
+        "nn",
+        "nynorsk",
+        "english",
+        "en",
+        "eksamensoppgave",
+    }
+    LF_KEYWORDS = {
+        "løsningsforslag",
+        "løsning",
+        "solution",
+        "solutions",
+        "lf",
+        "fasit",
+    }
+
+    header_row = None
+    thead = table.find("thead")
+    if thead:
+        header_row = thead.find("tr")
+    if not header_row:
+        # Fall back to first row if it contains <th>
+        for row in table.find_all("tr"):
+            if row.find("th"):
+                header_row = row
+                break
+
+    if not header_row:
+        return {}
+
+    roles = {}
+    col_index = 0
+    for cell in header_row.find_all(["th", "td"]):
+        text = cell.get_text(strip=True).lower()
+        colspan = int(cell.get("colspan", 1))
+
+        role = None
+        if any(kw in text for kw in LF_KEYWORDS):
+            role = "lf"
+        elif any(kw in text for kw in OPPGAVE_KEYWORDS):
+            role = "oppgave"
+
+        for i in range(colspan):
+            roles[col_index + i] = role
+        col_index += colspan
+
+    return roles
+
+
+def resolve_rows_with_rowspan(table):
+    """
+    Expands a table's rows accounting for rowspan, returning a list of
+    lists where each inner list contains (cell, role_hint) per logical column.
+    Only returns actual <td> cells (skips <th> header cells in body rows).
+    """
+    # Build a grid: grid[row][col] = tag or None
+    grid = []
+    # pending[(row, col)] = tag — cells that span into future rows
+    pending = {}
+
+    rows = table.find_all("tr")
+    for row_idx, row in enumerate(rows):
+        # Skip pure header rows
+        cells = row.find_all(["td", "th"])
+        if all(c.name == "th" for c in cells):
+            continue
+
+        grid_row = {}
+        # First, fill in pending (rowspan) cells
+        for (r, c), tag in list(pending.items()):
+            if r == row_idx:
+                grid_row[c] = tag
+
+        # Now place actual cells
+        col_cursor = 0
+        for cell in cells:
+            # Skip to next free slot
+            while col_cursor in grid_row:
+                col_cursor += 1
+
+            rowspan = int(cell.get("rowspan", 1))
+            colspan = int(cell.get("colspan", 1))
+
+            for dc in range(colspan):
+                grid_row[col_cursor + dc] = cell
+                for dr in range(1, rowspan):
+                    pending[(row_idx + dr, col_cursor + dc)] = cell
+
+            col_cursor += colspan
+
+        # Clean up pending entries we just consumed
+        for key in [k for k in pending if k[0] == row_idx]:
+            del pending[key]
+
+        if grid_row:
+            grid.append(grid_row)
+
+    return grid
+
+
+def download_pdf(pdf_url, category, downloaded_urls):
+    if pdf_url in downloaded_urls:
+        return
     filename = get_pdf_filename(pdf_url)
+
+    # Use category from column role if available, else infer from filename
+    if category == "lf":
+        folder = lf_folder
+    elif category == "oppgave":
+        folder = oppgave_folder
+    else:
+        folder = lf_folder if is_lf_filename(filename) else oppgave_folder
+
+    filepath = get_unique_filepath(folder, filename)
+
     try:
-        pdf_response = requests.get(pdf_url, timeout=30)
-        pdf_response.raise_for_status()
-
-        with open(filename, "wb") as f:
-            f.write(pdf_response.content)
-        downloaded_pdfs.append(filename)
-        print(f"✓ Downloaded ({source}): {os.path.basename(filename)}")
-        return True
+        response = requests.get(pdf_url, timeout=30)
+        response.raise_for_status()
+        with open(filepath, "wb") as f:
+            f.write(response.content)
+        downloaded_urls.add(pdf_url)
+        print(f"✓ [{category or 'auto'}] {os.path.basename(filepath)}")
     except requests.RequestException as e:
-        print(f"✗ Failed to download {pdf_url}: {e}")
-        return False
+        print(f"✗ Failed {pdf_url}: {e}")
 
 
-downloaded_urls = set()
+def scrape_url(url):
+    print(f"\n{'=' * 60}")
+    print(f"Scraping: {url}")
+    print("=" * 60)
+
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        print(f"Failed to fetch page: {e}")
+        return
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Remove midtsemester section if present
+    mid_heading = soup.find("h2", id="tidligere_midtsemesterprover_med_fasit")
+    if mid_heading:
+        section = mid_heading.find_next_sibling("div", class_="level2")
+        if section:
+            section.decompose()
+            print("Excluded midtsemester section.")
+
+    downloaded_urls = set()
+    total = 0
+
+    for table in soup.find_all("table"):
+        roles = detect_column_roles(table)
+        if not roles:
+            continue
+
+        grid = resolve_rows_with_rowspan(table)
+
+        exam_count = 0
+        for grid_row in grid:
+            if exam_count >= 30:
+                break
+            row_has_oppgave = any(
+                roles.get(col_idx) == "oppgave" and cell.find("a", href=True)
+                for col_idx, cell in grid_row.items()
+            )
+            if row_has_oppgave:
+                exam_count += 1
+            for col_idx, cell in grid_row.items():
+                role = roles.get(col_idx)
+                if role not in ("oppgave", "lf"):
+                    continue
+
+                for link in cell.find_all("a", href=True):
+                    href = link["href"]
+                    if ".pdf" not in href.lower():
+                        continue
+                    pdf_url = urljoin(url, href)
+                    if pdf_url not in downloaded_urls:
+                        download_pdf(pdf_url, role, downloaded_urls)
+                        total += 1
+
+    print(f"\n✓ Downloaded {total} PDF(s) from this page.")
 
 
-# Find all <a> links ending in .pdf
-for link in soup.find_all("a", href=True):
-    href = link["href"]
-    if ".pdf" not in href:
-        continue
-    pdf_url = urljoin(url, href)
-    if pdf_url not in downloaded_urls:
-        if download_pdf(pdf_url, source="embed"):
-            downloaded_urls.add(pdf_url)
+for url in urls:
+    scrape_url(url)
 
-for main_tag in soup.find_all("main", class_="pdf-document"):
-    pdf_url = main_tag.get("data-pdf")
-    if pdf_url:
-        pdf_url = urljoin(url, pdf_url)
-        if pdf_url not in downloaded_urls:
-            if download_pdf(pdf_url, source="embed"):
-                downloaded_urls.add(pdf_url)
-
-
-# Summary Output
-print("\n" + "=" * 50)
-if downloaded_pdfs:
-    print(f"✓ Successfully downloaded {len(downloaded_pdfs)} PDF file(s) to:")
-    print(f"  {os.path.abspath(folder_location)}")
-else:
-    print("⚠ No PDF files were downloaded.")
-print("=" * 50)
+print(f"\n{'=' * 60}")
+print(f"All done. Files saved to: {os.path.abspath(folder_location)}")
+print("=" * 60)
